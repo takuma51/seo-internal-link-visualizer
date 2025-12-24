@@ -1,4 +1,4 @@
+pandas
 networkx
 pyvis
-pandas
-scipy
+numpy
