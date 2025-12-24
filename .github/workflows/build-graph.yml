@@ -35,12 +35,17 @@ jobs:
 
       - name: Commit generated docs
         run: |
-          if git diff --quiet; then
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # docs配下の生成物を全部コミット対象にする（index.html + CSVなど）
+          git add docs/
+
+          # 変更がなければ終了
+          if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html
+
           git commit -m "Auto-build graph"
           git push
