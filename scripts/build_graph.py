@@ -44,7 +44,11 @@ HEIGHT = "900px"
 WIDTH = "100%"
 BG_COLOR = "#0b0f19"
 FONT_COLOR = "#ffffff"
-SHOW_LABEL = True   # ← ページだけに絞ればONでも耐えやすい
+SHOW_LABEL = True   # ページだけに絞ればONでも耐えやすい
+
+# レポート（GitHub Pagesで配布）
+REPORT_CSV = Path("docs/internal_link_rank.csv")
+REPORT_TOP_N = 300  # CSVを軽くしたければ 100〜300 くらい
 # =======================
 
 
@@ -96,12 +100,10 @@ def is_internal(url: str) -> bool:
 def is_asset_url(url: str) -> bool:
     p = path_of(url).lower()
 
-    # prefix除外
     for pref in EXCLUDE_PATH_PREFIXES:
         if p.startswith(pref):
             return True
 
-    # 拡張子除外
     m = re.search(r"(\.[a-z0-9]+)$", p)
     if m and m.group(1) in EXCLUDE_EXTENSIONS:
         return True
@@ -120,7 +122,13 @@ def to_bool_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
 
 
-def pagerank_power_iteration(G: nx.DiGraph, alpha: float = 0.85, max_iter: int = 200, tol: float = 1e-6) -> dict:
+def pagerank_power_iteration(
+    G: nx.DiGraph,
+    alpha: float = 0.85,
+    max_iter: int = 200,
+    tol: float = 1e-6
+) -> dict[str, float]:
+    """SciPy不要のPageRank（numpyだけでpower iteration）"""
     nodes = list(G.nodes())
     n = len(nodes)
     idx = {v: i for i, v in enumerate(nodes)}
@@ -132,7 +140,7 @@ def pagerank_power_iteration(G: nx.DiGraph, alpha: float = 0.85, max_iter: int =
     pr = np.ones(n, dtype=float) / n
     teleport = (1.0 - alpha) / n
 
-    in_neighbors = [[] for _ in range(n)]
+    in_neighbors: list[list[int]] = [[] for _ in range(n)]
     for u, v in G.edges():
         in_neighbors[idx[v]].append(idx[u])
 
@@ -154,13 +162,10 @@ def pagerank_power_iteration(G: nx.DiGraph, alpha: float = 0.85, max_iter: int =
 
 
 def short_label(url: str) -> str:
-    """
-    ラベルは短く。/category/seo-ja/ みたいに“意味がある部分”だけ出す。
-    """
+    """ラベルは短く。意味のあるpathだけ表示。"""
     p = path_of(url)
     if p == "/" or p == "":
         return "/"
-    # 先頭/末尾整形、長すぎる場合は省略
     p = p.strip("/")
     if len(p) > 45:
         return p[:20] + "…" + p[-20:]
@@ -206,10 +211,12 @@ def main():
     if edges.empty:
         raise ValueError("エッジが0件です。フィルタが厳しすぎる可能性があります。")
 
+    # グラフ構築
     G = nx.from_pandas_edgelist(edges, source="Source", target="Destination", create_using=nx.DiGraph())
     if G.number_of_nodes() == 0:
         raise ValueError("ノードが0です。CSVやフィルタ条件を見直してください。")
 
+    # PageRank（scipy不要）
     pr = pagerank_power_iteration(G, alpha=0.85, max_iter=200, tol=1e-6)
 
     # 上位ノードだけ
@@ -231,12 +238,34 @@ def main():
         G2.add_edges_from([(s, t) for _, s, t in keep])
         G = G2
 
+    # ========= レポート生成（ここが実務の本体） =========
+    report_rows = []
+    for node in G.nodes():
+        report_rows.append({
+            "url": node,
+            "path": path_of(node),
+            "label": short_label(node),
+            "pagerank": pr.get(node, 0.0),
+            "in_links": int(G.in_degree(node)),
+            "out_links": int(G.out_degree(node)),
+        })
+
+    report_df = pd.DataFrame(report_rows).sort_values("pagerank", ascending=False)
+
+    # 重要ページ上位だけ出す（重いならさらに絞る）
+    if REPORT_TOP_N is not None and len(report_df) > REPORT_TOP_N:
+        report_df = report_df.head(REPORT_TOP_N).copy()
+
+    REPORT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    report_df.to_csv(REPORT_CSV, index=False)
+
+    # ========= 可視化 =========
     net = Network(height=HEIGHT, width=WIDTH, directed=True, bgcolor=BG_COLOR, font_color=FONT_COLOR)
 
-    # barnes_hut の値は “動き” の調整。重さに効くのは iterations 固定の方
+    # barnes_hut の値は見た目調整。重さに効くのは stabilization の iterations 固定
     net.barnes_hut(gravity=-5000, central_gravity=0.25, spring_length=160, spring_strength=0.03, damping=0.35)
 
-    # stabilization を有限にして必ず終わらせる
+    # stabilization を有限にして必ず終わらせる（0%で止まる対策）
     net.set_options(
         """
         var options = {
@@ -260,7 +289,12 @@ def main():
         score = (pr.get(n, 0.0) / max_pr) if max_pr else 0.0
         size = 8 + (score * 35)
         label = short_label(n) if SHOW_LABEL else ""
-        net.add_node(n, label=label, title=f"{n}<br>PageRank: {pr.get(n, 0.0):.8f}", size=size)
+        net.add_node(
+            n,
+            label=label,
+            title=f"{n}<br>PageRank: {pr.get(n, 0.0):.8f}<br>in:{G.in_degree(n)} out:{G.out_degree(n)}",
+            size=size
+        )
 
     for s, t in G.edges():
         net.add_edge(s, t)
@@ -269,6 +303,7 @@ def main():
     net.write_html(str(OUTPUT))
 
     print(f"Saved: {OUTPUT}")
+    print(f"Saved report: {REPORT_CSV}")
     print(f"Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
 
 
