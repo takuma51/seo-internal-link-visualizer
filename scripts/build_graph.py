@@ -9,7 +9,10 @@ from pyvis.network import Network
 
 # ========= 設定 =========
 INPUT = Path("data/all_outlinks.csv")
-OUTPUT = Path("docs/index.html")
+
+# GitHub Pagesに載せる出力
+OUTPUT_HTML = Path("docs/index.html")
+REPORT_CSV = Path("docs/internal_link_rank.csv")
 
 TARGET_DOMAIN = "okatakuma.tokyo"
 
@@ -20,7 +23,7 @@ DROP_SAME_URL_EDGE = True
 DROP_QUERY_AND_FRAGMENT = True
 DROP_TRAILING_SLASH = True
 
-# 重さ対策
+# 重さ対策（可視化だけに効かせる）
 TOP_N_NODES = 250
 MAX_EDGES = 3000
 
@@ -44,11 +47,10 @@ HEIGHT = "900px"
 WIDTH = "100%"
 BG_COLOR = "#0b0f19"
 FONT_COLOR = "#ffffff"
-SHOW_LABEL = True   # ページだけに絞ればONでも耐えやすい
+SHOW_LABEL = True  # ページだけに絞ればONでも耐えやすい
 
-# レポート（GitHub Pagesで配布）
-REPORT_CSV = Path("docs/internal_link_rank.csv")
-REPORT_TOP_N = 300  # CSVを軽くしたければ 100〜300 くらい
+# レポートの行数（大きすぎるとCSVが重くなるので上位だけにしたい場合）
+REPORT_TOP_N = 300  # None にすると全行出す
 # =======================
 
 
@@ -211,61 +213,59 @@ def main():
     if edges.empty:
         raise ValueError("エッジが0件です。フィルタが厳しすぎる可能性があります。")
 
-    # グラフ構築
-    G = nx.from_pandas_edgelist(edges, source="Source", target="Destination", create_using=nx.DiGraph())
-    if G.number_of_nodes() == 0:
+    # ========= 1) 全体グラフ（レポート用） =========
+    G_all = nx.from_pandas_edgelist(edges, source="Source", target="Destination", create_using=nx.DiGraph())
+    if G_all.number_of_nodes() == 0:
         raise ValueError("ノードが0です。CSVやフィルタ条件を見直してください。")
 
-    # PageRank（scipy不要）
-    pr = pagerank_power_iteration(G, alpha=0.85, max_iter=200, tol=1e-6)
+    pr_all = pagerank_power_iteration(G_all, alpha=0.85, max_iter=200, tol=1e-6)
 
-    # 上位ノードだけ
-    if TOP_N_NODES is not None and G.number_of_nodes() > TOP_N_NODES:
-        top_nodes = [n for n, _ in sorted(pr.items(), key=lambda x: x[1], reverse=True)[:TOP_N_NODES]]
-        top_set = set(top_nodes)
-        G = G.subgraph(top_set).copy()
-        pr = {n: pr[n] for n in G.nodes()}
-
-    # エッジ上限
-    if MAX_EDGES is not None and G.number_of_edges() > MAX_EDGES:
-        scored = []
-        for s, t in G.edges():
-            scored.append((pr.get(s, 0.0) + pr.get(t, 0.0), s, t))
-        scored.sort(reverse=True)
-        keep = scored[:MAX_EDGES]
-        G2 = nx.DiGraph()
-        G2.add_nodes_from(G.nodes())
-        G2.add_edges_from([(s, t) for _, s, t in keep])
-        G = G2
-
-    # ========= レポート生成（ここが実務の本体） =========
+    # ========= 2) レポートCSV（ここが本体） =========
     report_rows = []
-    for node in G.nodes():
+    for node in G_all.nodes():
         report_rows.append({
             "url": node,
             "path": path_of(node),
             "label": short_label(node),
-            "pagerank": pr.get(node, 0.0),
-            "in_links": int(G.in_degree(node)),
-            "out_links": int(G.out_degree(node)),
+            "pagerank": pr_all.get(node, 0.0),
+            "in_links": int(G_all.in_degree(node)),
+            "out_links": int(G_all.out_degree(node)),
         })
 
     report_df = pd.DataFrame(report_rows).sort_values("pagerank", ascending=False)
 
-    # 重要ページ上位だけ出す（重いならさらに絞る）
     if REPORT_TOP_N is not None and len(report_df) > REPORT_TOP_N:
         report_df = report_df.head(REPORT_TOP_N).copy()
 
     REPORT_CSV.parent.mkdir(parents=True, exist_ok=True)
     report_df.to_csv(REPORT_CSV, index=False)
 
-    # ========= 可視化 =========
+    # ========= 3) 可視化用に軽量化 =========
+    G_vis = G_all
+    pr_vis = pr_all
+
+    if TOP_N_NODES is not None and G_vis.number_of_nodes() > TOP_N_NODES:
+        top_nodes = [n for n, _ in sorted(pr_vis.items(), key=lambda x: x[1], reverse=True)[:TOP_N_NODES]]
+        top_set = set(top_nodes)
+        G_vis = G_vis.subgraph(top_set).copy()
+        pr_vis = {n: pr_vis[n] for n in G_vis.nodes()}
+
+    if MAX_EDGES is not None and G_vis.number_of_edges() > MAX_EDGES:
+        scored = []
+        for s, t in G_vis.edges():
+            scored.append((pr_vis.get(s, 0.0) + pr_vis.get(t, 0.0), s, t))
+        scored.sort(reverse=True)
+        keep = scored[:MAX_EDGES]
+        G2 = nx.DiGraph()
+        G2.add_nodes_from(G_vis.nodes())
+        G2.add_edges_from([(s, t) for _, s, t in keep])
+        G_vis = G2
+
+    # ========= 4) HTML生成 =========
     net = Network(height=HEIGHT, width=WIDTH, directed=True, bgcolor=BG_COLOR, font_color=FONT_COLOR)
 
-    # barnes_hut の値は見た目調整。重さに効くのは stabilization の iterations 固定
     net.barnes_hut(gravity=-5000, central_gravity=0.25, spring_length=160, spring_strength=0.03, damping=0.35)
 
-    # stabilization を有限にして必ず終わらせる（0%で止まる対策）
     net.set_options(
         """
         var options = {
@@ -284,27 +284,28 @@ def main():
         """
     )
 
-    max_pr = max(pr.values()) if pr else 1.0
-    for n in G.nodes():
-        score = (pr.get(n, 0.0) / max_pr) if max_pr else 0.0
+    max_pr = max(pr_vis.values()) if pr_vis else 1.0
+    for n in G_vis.nodes():
+        score = (pr_vis.get(n, 0.0) / max_pr) if max_pr else 0.0
         size = 8 + (score * 35)
         label = short_label(n) if SHOW_LABEL else ""
         net.add_node(
             n,
             label=label,
-            title=f"{n}<br>PageRank: {pr.get(n, 0.0):.8f}<br>in:{G.in_degree(n)} out:{G.out_degree(n)}",
+            title=f"{n}<br>PageRank: {pr_vis.get(n, 0.0):.8f}<br>in:{G_vis.in_degree(n)} out:{G_vis.out_degree(n)}",
             size=size
         )
 
-    for s, t in G.edges():
+    for s, t in G_vis.edges():
         net.add_edge(s, t)
 
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    net.write_html(str(OUTPUT))
+    OUTPUT_HTML.parent.mkdir(parents=True, exist_ok=True)
+    net.write_html(str(OUTPUT_HTML))
 
-    print(f"Saved: {OUTPUT}")
+    print(f"Saved: {OUTPUT_HTML}")
     print(f"Saved report: {REPORT_CSV}")
-    print(f"Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
+    print(f"All nodes/edges: {G_all.number_of_nodes()} / {G_all.number_of_edges()}")
+    print(f"Vis nodes/edges: {G_vis.number_of_nodes()} / {G_vis.number_of_edges()}")
 
 
 if __name__ == "__main__":
