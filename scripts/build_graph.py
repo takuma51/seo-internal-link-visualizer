@@ -13,41 +13,42 @@ OUTPUT = Path("docs/index.html")
 
 TARGET_DOMAIN = "okatakuma.tokyo"
 
-# SF出力のフィルタ
 ONLY_STATUS_200 = True
 ONLY_FOLLOW_TRUE = True
 DROP_SAME_URL_EDGE = True
 
-# URL正規化
 DROP_QUERY_AND_FRAGMENT = True
 DROP_TRAILING_SLASH = True
 
-# “SEO内部リンク”として見たいURLだけ残す（超重要）
-EXCLUDE_WP_CONTENT = True  # /wp-content/ を除外
-EXCLUDE_EXTENSIONS = (
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+# 重さ対策
+TOP_N_NODES = 250
+MAX_EDGES = 3000
+
+# 「ページだけ」に寄せる（超重要）
+EXCLUDE_PATH_PREFIXES = [
+    "/wp-content/uploads/",
+    "/wp-includes/",
+    "/wp-content/themes/",
+    "/wp-content/plugins/",
+]
+EXCLUDE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
     ".css", ".js", ".map",
+    ".pdf", ".zip", ".rar", ".7z",
+    ".mp4", ".mov", ".avi", ".mp3", ".wav",
     ".woff", ".woff2", ".ttf", ".eot",
-    ".pdf", ".zip", ".gz",
-    ".mp4", ".webm", ".mov",
-)
+}
 
-# 可視化の重さ対策
-TOP_N_NODES = 250          # 150〜250推奨
-MAX_EDGES = 4000           # エッジ多すぎると固まりやすい
-
-# PyVis（vis-network）
+# PyVis
 HEIGHT = "900px"
 WIDTH = "100%"
 BG_COLOR = "#0b0f19"
 FONT_COLOR = "#ffffff"
-SHOW_LABEL = False         # URLラベルは重いので基本OFF
+SHOW_LABEL = True   # ← ページだけに絞ればONでも耐えやすい
 # =======================
 
 
-# ---------- URL & フィルタ ----------
 def normalize_url(url: str) -> str:
-    """URLを安定した形に正規化（scheme/host小文字、?/#削除、末尾/統一）"""
     if url is None:
         return ""
     url = str(url).strip()
@@ -80,31 +81,35 @@ def host_of(url: str) -> str:
         return ""
 
 
+def path_of(url: str) -> str:
+    try:
+        return urlparse(url).path or "/"
+    except Exception:
+        return "/"
+
+
 def is_internal(url: str) -> bool:
-    """同一ドメイン（サブドメイン含む）判定"""
     h = host_of(url)
     return (h == TARGET_DOMAIN) or h.endswith("." + TARGET_DOMAIN)
 
 
-def is_page_like(url: str) -> bool:
-    """画像/CSS/JSなどの静的アセットを除外して“ページっぽいURL”だけに寄せる"""
-    u = (url or "").lower()
+def is_asset_url(url: str) -> bool:
+    p = path_of(url).lower()
 
-    if EXCLUDE_WP_CONTENT and "/wp-content/" in u:
-        return False
+    # prefix除外
+    for pref in EXCLUDE_PATH_PREFIXES:
+        if p.startswith(pref):
+            return True
 
-    # クエリ削除後でも念のため拡張子判定（pathで判定）
-    try:
-        path = urlparse(u).path or ""
-    except Exception:
-        path = u
+    # 拡張子除外
+    m = re.search(r"(\.[a-z0-9]+)$", p)
+    if m and m.group(1) in EXCLUDE_EXTENSIONS:
+        return True
 
-    return not path.endswith(EXCLUDE_EXTENSIONS)
+    return False
 
 
-# ---------- 便利関数 ----------
 def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """列名ゆらぎ吸収"""
     for c in candidates:
         if c in df.columns:
             return c
@@ -112,22 +117,12 @@ def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 
 def to_bool_series(s: pd.Series) -> pd.Series:
-    """true/false/1/0/yes/noのゆらぎ吸収"""
     return s.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
 
 
-# ---------- SciPy不要のPageRank（numpyでpower iteration） ----------
-def pagerank_power_iteration(
-    G: nx.DiGraph,
-    alpha: float = 0.85,
-    max_iter: int = 200,
-    tol: float = 1e-6
-) -> dict[str, float]:
+def pagerank_power_iteration(G: nx.DiGraph, alpha: float = 0.85, max_iter: int = 200, tol: float = 1e-6) -> dict:
     nodes = list(G.nodes())
     n = len(nodes)
-    if n == 0:
-        return {}
-
     idx = {v: i for i, v in enumerate(nodes)}
 
     out_deg = np.zeros(n, dtype=float)
@@ -158,7 +153,20 @@ def pagerank_power_iteration(
     return {nodes[i]: float(pr[i]) for i in range(n)}
 
 
-# ---------- メイン ----------
+def short_label(url: str) -> str:
+    """
+    ラベルは短く。/category/seo-ja/ みたいに“意味がある部分”だけ出す。
+    """
+    p = path_of(url)
+    if p == "/" or p == "":
+        return "/"
+    # 先頭/末尾整形、長すぎる場合は省略
+    p = p.strip("/")
+    if len(p) > 45:
+        return p[:20] + "…" + p[-20:]
+    return p
+
+
 def main():
     df = pd.read_csv(INPUT, low_memory=False)
 
@@ -172,13 +180,13 @@ def main():
     df[col_dest] = df[col_dest].astype(str).map(normalize_url)
     df = df[(df[col_source] != "") & (df[col_dest] != "")]
 
-    # 内部リンクのみ
+    # 内部リンク
     df = df[df[col_source].map(is_internal)]
     df = df[df[col_dest].map(is_internal)]
 
-    # “ページっぽいURL”だけ残す（←ここが見た目と速度に一番効く）
-    df = df[df[col_source].map(is_page_like)]
-    df = df[df[col_dest].map(is_page_like)]
+    # ページだけ（アセット除外）
+    df = df[~df[col_source].map(is_asset_url)]
+    df = df[~df[col_dest].map(is_asset_url)]
 
     # ステータス200
     col_status = pick_col(df, ["Status Code", "Status", "HTTP Status Code", "Response Code"])
@@ -196,47 +204,45 @@ def main():
 
     edges = df[[col_source, col_dest]].dropna().rename(columns={col_source: "Source", col_dest: "Destination"})
     if edges.empty:
-        raise ValueError("エッジが0件です。フィルタが厳しすぎる可能性があります（wp-content除外等）。")
+        raise ValueError("エッジが0件です。フィルタが厳しすぎる可能性があります。")
 
-    # グラフ構築
     G = nx.from_pandas_edgelist(edges, source="Source", target="Destination", create_using=nx.DiGraph())
     if G.number_of_nodes() == 0:
         raise ValueError("ノードが0です。CSVやフィルタ条件を見直してください。")
 
-    # PageRank（SciPy不要）
     pr = pagerank_power_iteration(G, alpha=0.85, max_iter=200, tol=1e-6)
 
-    # 上位ノードだけ残す
+    # 上位ノードだけ
     if TOP_N_NODES is not None and G.number_of_nodes() > TOP_N_NODES:
         top_nodes = [n for n, _ in sorted(pr.items(), key=lambda x: x[1], reverse=True)[:TOP_N_NODES]]
         top_set = set(top_nodes)
         G = G.subgraph(top_set).copy()
-        pr = {n: pr.get(n, 0.0) for n in G.nodes()}
+        pr = {n: pr[n] for n in G.nodes()}
 
-    # エッジ上限（重さ対策）
+    # エッジ上限
     if MAX_EDGES is not None and G.number_of_edges() > MAX_EDGES:
         scored = []
         for s, t in G.edges():
             scored.append((pr.get(s, 0.0) + pr.get(t, 0.0), s, t))
         scored.sort(reverse=True)
         keep = scored[:MAX_EDGES]
-
         G2 = nx.DiGraph()
         G2.add_nodes_from(G.nodes())
         G2.add_edges_from([(s, t) for _, s, t in keep])
         G = G2
 
-    # PyVis出力
     net = Network(height=HEIGHT, width=WIDTH, directed=True, bgcolor=BG_COLOR, font_color=FONT_COLOR)
 
-    # 物理エンジン（止まらない=0%対策：stabilization iterationsを制限）
-    net.barnes_hut(gravity=-8000, central_gravity=0.2, spring_length=180, spring_strength=0.02, damping=0.25)
+    # barnes_hut の値は “動き” の調整。重さに効くのは iterations 固定の方
+    net.barnes_hut(gravity=-5000, central_gravity=0.25, spring_length=160, spring_strength=0.03, damping=0.35)
+
+    # stabilization を有限にして必ず終わらせる
     net.set_options(
         """
         var options = {
           "physics": {
             "enabled": true,
-            "stabilization": { "enabled": true, "iterations": 200, "updateInterval": 25 }
+            "stabilization": { "enabled": true, "iterations": 120, "updateInterval": 25 }
           },
           "nodes": { "shape": "dot" },
           "edges": { "smooth": false },
@@ -252,8 +258,8 @@ def main():
     max_pr = max(pr.values()) if pr else 1.0
     for n in G.nodes():
         score = (pr.get(n, 0.0) / max_pr) if max_pr else 0.0
-        size = 8 + (score * 35)  # 8〜43くらい
-        label = n if SHOW_LABEL else ""
+        size = 8 + (score * 35)
+        label = short_label(n) if SHOW_LABEL else ""
         net.add_node(n, label=label, title=f"{n}<br>PageRank: {pr.get(n, 0.0):.8f}", size=size)
 
     for s, t in G.edges():
@@ -264,7 +270,6 @@ def main():
 
     print(f"Saved: {OUTPUT}")
     print(f"Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
-    print(f"Input edges(after filters): {len(edges)}")
 
 
 if __name__ == "__main__":
