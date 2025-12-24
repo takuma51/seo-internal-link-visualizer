@@ -18,7 +18,7 @@ ONLY_FOLLOW_TRUE = True         # True: Follow列がtrueのみ（SF出力にあ�
 DROP_SAME_URL_EDGE = True       # source==destination を除外
 DROP_QUERY_AND_FRAGMENT = True  # URLの ? と # を落として正規化（重複ノード削減に効く）
 DROP_TRAILING_SLASH = True      # 末尾スラッシュを統一（/ と無しの重複回避）
-TOP_N_NODES = 400               # 重い場合は下げる（例: 200）。Noneで無制限
+TOP_N_NODES = 200               # Pagesで固まりやすいのでまずは200推奨。重ければ100へ。
 
 # 可視化（PyVis）
 HEIGHT = "800px"
@@ -26,6 +26,7 @@ WIDTH = "100%"
 BG_COLOR = "#0b0f19"
 FONT_COLOR = "#ffffff"
 SHOW_LABEL = False              # TrueでURLラベルを表示（重くなる）
+USE_PHYSICS = True              # 重い場合 False にすると一気に軽くなる
 # =======================
 
 
@@ -117,7 +118,6 @@ def main():
     # 5) 追加フィルタ（列がある時だけ適用）
     col_status = pick_col(df, ["Status Code", "Status", "HTTP Status Code", "Response Code"])
     if ONLY_STATUS_200 and col_status:
-        # 数値になってる/文字列になってる両方を吸収
         df = df[pd.to_numeric(df[col_status], errors="coerce") == 200]
 
     col_follow = pick_col(df, ["Follow", "follow", "Is Follow", "Link Follow"])
@@ -127,7 +127,7 @@ def main():
     if DROP_SAME_URL_EDGE:
         df = df[df[col_source] != df[col_dest]]
 
-    # 6) グラフ構築（有向）
+    # 6) エッジ整形
     edges = df[[col_source, col_dest]].dropna()
     edges = edges.rename(columns={col_source: "Source", col_dest: "Destination"})
 
@@ -140,27 +140,38 @@ def main():
             "- CSVが本当に内部リンク（同一ドメイン）を含んでいるか"
         )
 
+    # 7) グラフ構築（有向）
     G = nx.from_pandas_edgelist(edges, source="Source", target="Destination", create_using=nx.DiGraph())
 
     if G.number_of_nodes() == 0:
         raise ValueError("ノードが0です。CSVの内容かフィルタ条件を見直してください。")
 
-    # 7) PageRank（SciPy不要のpower iteration固定）
-    # ※ networkx の環境によっては pagerank() が scipy を要求するケースがあるため、
-    #    pagerank_scipy に落ちない形で power iteration を明示します。
-    pr = nx.pagerank(G, alpha=0.85, max_iter=200, tol=1.0e-6)
+    # 8) PageRank（SciPy不要で確実に動く版）
+    #    pagerank() は環境によって scipy を要求して落ちることがあるため固定で numpy 版を使う
+    pr = nx.pagerank_numpy(G, alpha=0.85)
     nx.set_node_attributes(G, pr, "pagerank")
 
-    # 8) 重い場合のノード削減（上位Nのみ表示）
+    # 9) 重い場合のノード削減（上位Nのみ表示）
     if TOP_N_NODES is not None and G.number_of_nodes() > TOP_N_NODES:
         top_nodes = sorted(pr.items(), key=lambda x: x[1], reverse=True)[:TOP_N_NODES]
         top_nodes_set = {n for n, _ in top_nodes}
         G = G.subgraph(top_nodes_set).copy()
         pr = {n: pr[n] for n in G.nodes()}
 
-    # 9) PyVisでHTML出力
+    # 10) PyVisでHTML出力
     net = Network(height=HEIGHT, width=WIDTH, directed=True, bgcolor=BG_COLOR, font_color=FONT_COLOR)
-    net.barnes_hut()
+
+    if USE_PHYSICS:
+        # ここを調整するとPages上で固まりにくくなる
+        net.barnes_hut(
+            gravity=-8000,
+            central_gravity=0.3,
+            spring_length=120,
+            spring_strength=0.01,
+            damping=0.9
+        )
+    else:
+        net.toggle_physics(False)
 
     # ノード追加（PageRankに応じてサイズ調整）
     max_pr = max(pr.values()) if pr else 1.0
@@ -179,7 +190,7 @@ def main():
     for s, t in G.edges():
         net.add_edge(s, t)
 
-    # 10) 保存
+    # 11) 保存
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     net.write_html(str(OUTPUT))
 
